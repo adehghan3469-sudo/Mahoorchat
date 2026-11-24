@@ -1,0 +1,301 @@
+import streamlit as st
+from openai import OpenAI
+import ee
+import geemap.foliumap as geemap
+from datetime import datetime, timedelta
+import plotly.graph_objects as go
+import jdatetime  # برای تاریخ شمسی (pip install jdatetime)
+
+# -------------------------------------------------
+# تنظیمات صفحه
+# -------------------------------------------------
+st.set_page_config(
+    page_title="از بابامنیر چه خبر",
+    page_icon="🌾",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# -------------------------------------------------
+# استایل سفارشی (نزدیک به ظاهر فعلی اپ)
+# -------------------------------------------------
+st.markdown("""
+<style>
+    .stApp {
+        background-color: #f8f9fa;
+    }
+    [data-testid="stSidebar"] {
+        background-color: #1a3c34;
+    }
+    [data-testid="stSidebar"] * {
+        color: white !important;
+    }
+    .metric-card {
+        background: white;
+        padding: 16px;
+        border-radius: 12px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+        text-align: center;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------------------------------
+# داده‌های نمونه هواشناسی (بعداً با API واقعی جایگزین کن)
+# -------------------------------------------------
+def get_current_weather():
+    return {
+        "temp": 13.4,
+        "feels_like": 13.7,
+        "humidity": 90,
+        "et0": 2.7,
+        "rain_prob": 0,
+        "wind": 2,
+        "wind_dir": "جنوب",
+        "condition": "صاف و آفتابی",
+        "min_temp": 9,
+        "max_temp": 25,
+        "location": "بابامنیر",
+        "date": "سه‌شنبه ۳ آذر ۱۴۰۵",
+        "time": "۱۸:۳۲"
+    }
+
+# -------------------------------------------------
+# بخش گروک (از من بپرس)
+# -------------------------------------------------
+def get_grok_client():
+    return OpenAI(
+        api_key=st.secrets["xai"]["api_key"],
+        base_url="https://api.x.ai/v1"
+    )
+
+def build_system_prompt(weather: dict) -> str:
+    return f"""تو یک دستیار کشاورزی هوشمند و باتجربه مخصوص منطقه **بابامنیر** (استان فارس) هستی.
+
+اطلاعات هواشناسی فعلی:
+- مکان: {weather['location']}
+- تاریخ: {weather['date']} | ساعت {weather['time']}
+- دمای فعلی: {weather['temp']}°C (احساس: {weather['feels_like']}°C)
+- حداقل / حداکثر: {weather['min_temp']} / {weather['max_temp']}°C
+- رطوبت: {weather['humidity']}%
+- احتمال بارش: {weather['rain_prob']}%
+- باد: {weather['wind']} km/h از {weather['wind_dir']}
+- وضعیت: {weather['condition']}
+- ET₀ امروز: {weather['et0']} میلی‌متر
+
+دستورالعمل‌ها:
+- پاسخ‌ها را ساده، کاربردی و به زبان فارسی بده.
+- توصیه‌های آبیاری را بر اساس ET₀ و احتمال بارش بده.
+- مختصر و عملی صحبت کن.
+"""
+
+def ask_grok_page(weather: dict):
+    st.header("🤖 از من بپرس — دستیار کشاورزی بابامنیر")
+    st.caption("سوالات خود را در مورد آبیاری، سم‌پاشی، کاشت و شرایط فعلی بپرسید.")
+
+    if "chat_messages" not in st.session_state:
+        st.session_state.chat_messages = []
+
+    for msg in st.session_state.chat_messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    if prompt := st.chat_input("سوال خود را بنویسید..."):
+        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        system_prompt = build_system_prompt(weather)
+        recent = st.session_state.chat_messages[-8:]
+        api_messages = [{"role": "system", "content": system_prompt}] + recent
+
+        with st.chat_message("assistant"):
+            with st.spinner("در حال بررسی شرایط فعلی..."):
+                try:
+                    client = get_grok_client()
+                    response = client.chat.completions.create(
+                        model="grok-3",
+                        messages=api_messages,
+                        temperature=0.35,
+                        max_tokens=800
+                    )
+                    answer = response.choices[0].message.content
+                    st.markdown(answer)
+                    st.session_state.chat_messages.append({"role": "assistant", "content": answer})
+                except Exception as e:
+                    st.error(f"خطا در ارتباط با گروک: {e}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🗑️ پاک کردن گفتگو", use_container_width=True):
+            st.session_state.chat_messages = []
+            st.rerun()
+
+# -------------------------------------------------
+# بخش پایش ماهواره‌ای (NDVI)
+# -------------------------------------------------
+def initialize_gee():
+    try:
+        credentials = ee.ServiceAccountCredentials(
+            email=st.secrets["gee"]["client_email"],
+            key_data=st.secrets["gee"]["private_key"]
+        )
+        ee.Initialize(credentials)
+        return True
+    except Exception as e:
+        st.error(f"خطا در اتصال به Google Earth Engine: {e}")
+        return False
+
+def get_babamonir_region():
+    point = ee.Geometry.Point(51.206, 30.072)
+    return point.buffer(6000)
+
+def satellite_page():
+    st.header("🛰️ پایش ماهواره‌ای — شاخص NDVI بابامنیر")
+
+    if not initialize_gee():
+        st.info("برای فعال شدن این بخش، ابتدا Service Account گوگل ارث انجین را در Secrets تنظیم کنید.")
+        return
+
+    col1, col2 = st.columns(2)
+    with col1:
+        days = st.slider("چند روز اخیر؟", 7, 45, 15)
+    with col2:
+        cloud = st.slider("حداکثر پوشش ابر (%)", 5, 40, 20)
+
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=days)
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+
+    region = get_babamonir_region()
+
+    with st.spinner("در حال دریافت تصاویر ماهواره‌ای..."):
+        try:
+            collection = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+                          .filterBounds(region)
+                          .filterDate(start_str, end_str)
+                          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud)))
+
+            def add_ndvi(img):
+                ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
+                return img.addBands(ndvi)
+
+            ndvi_col = collection.map(add_ndvi)
+            ndvi_img = ndvi_col.median().select("NDVI").clip(region)
+
+            mean_dict = ndvi_img.reduceRegion(
+                reducer=ee.Reducer.mean(),
+                geometry=region,
+                scale=10,
+                maxPixels=1e9
+            )
+            mean_ndvi = mean_dict.getInfo().get("NDVI")
+
+            if mean_ndvi is None:
+                st.warning("تصویر مناسبی پیدا نشد. بازه یا درصد ابر را تغییر دهید.")
+                return
+
+            st.metric("میانگین NDVI منطقه", f"{mean_ndvi:.3f}")
+            st.caption(f"بازه: {start_str} تا {end_str}")
+
+            Map = geemap.Map(center=[30.072, 51.206], zoom=12)
+            ndvi_vis = {
+                "min": 0.0, "max": 0.8,
+                "palette": ["FFFFFF", "CE7E45", "DF923D", "F1B555", "FCD163",
+                            "99B718", "74A901", "66A000", "529400", "3E8601"]
+            }
+            Map.addLayer(ndvi_img, ndvi_vis, "NDVI")
+            Map.addLayer(region, {"color": "red"}, "محدوده", opacity=0.3)
+            Map.to_streamlit(height=500)
+
+        except Exception as e:
+            st.error(f"خطا: {e}")
+
+# -------------------------------------------------
+# صفحه خلاصه روز
+# -------------------------------------------------
+def daily_summary_page(weather: dict):
+    st.title("🌾 از بابامنیر چه خبر")
+    st.caption(f"منطقه: {weather['location']} | تاریخ: {weather['date']} | ساعت: {weather['time']}")
+
+    # متریک‌ها
+    col1, col2, col3, col4, col5 = st.columns(5)
+    col1.metric("ET₀ امروز", f"{weather['et0']} mm")
+    col2.metric("احتمال بارش", f"{weather['rain_prob']}%")
+    col3.metric("رطوبت", f"{weather['humidity']}%")
+    col4.metric("حداقل / حداکثر", f"{weather['min_temp']} / {weather['max_temp']}°C")
+    col5.metric("دمای فعلی", f"{weather['temp']}°C", delta=f"احساس {weather['feels_like']}°C")
+
+    st.info(f"وضعیت فعلی: {weather['condition']} | باد: {weather['wind']} km/h از {weather['wind_dir']}")
+
+    # نمودار ۷ روزه (نمونه)
+    st.subheader("📈 پیش‌بینی دمای ۷ روزه")
+    days = ["۲۴ آبان", "۲۵ آبان", "۲۶ آبان", "۲۷ آبان", "۲۸ آبان", "۲۹ آبان", "۳۰ آبان"]
+    max_temps = [25, 25, 24, 25, 24, 23, 22]
+    min_temps = [10, 9, 9, 8, 8, 7, 10]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=days, y=max_temps, mode="lines+markers", name="حداکثر", line=dict(color="red")))
+    fig.add_trace(go.Scatter(x=days, y=min_temps, mode="lines+markers", name="حداقل", line=dict(color="blue")))
+    fig.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+# -------------------------------------------------
+# صفحات دیگر (آماده برای پر کردن)
+# -------------------------------------------------
+def placeholder_page(title: str):
+    st.header(title)
+    st.info("این بخش به زودی تکمیل می‌شود.")
+
+# -------------------------------------------------
+# منوی اصلی
+# -------------------------------------------------
+with st.sidebar:
+    st.markdown("## 🌾 از بابامنیر چه خبر")
+    st.markdown("---")
+    
+    menu = st.radio(
+        "بخش‌های داشبورد",
+        [
+            "خلاصه روز",
+            "هواشناسی زنده",
+            "مقایسه مناطق",
+            "اخبار و هشدارها",
+            "از من بپرس",
+            "قیمت نهاده‌ها",
+            "توصیه‌های فنی",
+            "پایش ماهواره‌ای",
+            "تنظیمات و نوتیفیکیشن"
+        ],
+        label_visibility="collapsed"
+    )
+    
+    st.markdown("---")
+    st.caption("ساعت: ۱۸:۳۲")
+    st.caption("سه‌شنبه ۳ آذر ۱۴۰۵")
+    st.caption("واتساپ: ۰۹۱۷۴۸۰۸۷۵۵")
+
+# -------------------------------------------------
+# مسیریابی صفحات
+# -------------------------------------------------
+weather = get_current_weather()
+
+if menu == "خلاصه روز":
+    daily_summary_page(weather)
+elif menu == "از من بپرس":
+    ask_grok_page(weather)
+elif menu == "پایش ماهواره‌ای":
+    satellite_page()
+elif menu == "هواشناسی زنده":
+    placeholder_page("🌤️ هواشناسی زنده")
+elif menu == "مقایسه مناطق":
+    placeholder_page("📊 مقایسه مناطق")
+elif menu == "اخبار و هشدارها":
+    placeholder_page("📰 اخبار و هشدارها")
+elif menu == "قیمت نهاده‌ها":
+    placeholder_page("💰 قیمت نهاده‌ها")
+elif menu == "توصیه‌های فنی":
+    placeholder_page("🛠️ توصیه‌های فنی")
+elif menu == "تنظیمات و نوتیفیکیشن":
+    placeholder_page("⚙️ تنظیمات و نوتیفیکیشن")
